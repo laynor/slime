@@ -397,6 +397,8 @@
    (set! thread-chan-hash (make-eq-hashtable))
    (set! partner-chan c0)
    (hashtable-set! thread-chan-hash (@ owner c0) c0))
+  ((flush)
+   #!void)
   ((write (ch :: char))
    (send (current-thread-channel)
 	 `(:write-string ,(format "~a" ch))))
@@ -425,6 +427,8 @@
 ;; using bidirectional channels just sucks.  Mailboxes owned by a
 ;; single thread to which everybody can send are much easier to use.
 
+(define *slime-repl-output-port* #f)
+
 (df dispatch-events ((s <socket>))
   (mlet* ((charset "iso-8859-1")
           (ins (<in> (! getInputStream s) charset))
@@ -446,7 +450,8 @@
           (vm (let ((vm #f)) (fun () (or vm (rpc dbg `(get-vm))))))
 	  (slime-output-port (output-port (swank-output-stream output-stream out))))
 
-    (current-output-port slime-output-port)
+	 (set! *slime-repl-output-port* slime-output-port)
+    ;;(current-output-port slime-output-port)
     (while #t
       (mlet ((c . event) (recv* (append (list in out dbg listener)
                                         (if inspector (list inspector) '())
@@ -713,7 +718,8 @@
 
 (defslimefun listener-eval (env string)
   (let* ((form (read-from-string string))
-         (list (values-to-list (eval form env))))
+         (list (values-to-list (parameterize ((current-output-port *slime-repl-output-port*))
+				 (eval form env)))))
   `(:values ,@(map pprint-to-string list))))
 
 (defslimefun pprint-eval (env string)
@@ -831,7 +837,7 @@
 
 ;;;; Completion
 
-(defslimefun simple-completions (env (pattern <str>) _)
+(define (completions-with-matcher env (pattern <str>) match?)
   (let* ((env (as <gnu.mapping.InheritingEnvironment> env))
          (matches (packing (pack)
                     (let ((iter (! enumerate-all-locations env)))
@@ -840,10 +846,14 @@
                           (typecase l
                             (<gnu.mapping.NamedLocation>
                              (let ((name (!! get-name get-key-symbol l)))
-                               (when (! starts-with name pattern)
+                               (when (match? pattern name)
                                  (pack name)))))))))))
     `(,matches ,(cond ((null? matches) pattern)
                       (#t (fold+ common-prefix matches))))))
+
+
+(defslimefun simple-completions (env (pattern <str>) _)
+  (completions-with-matcher env pattern (lambda (pattern name) (! starts-with name pattern))))
 
 (df common-prefix ((s1 <str>) (s2 <str>) => <str>)
   (let ((limit (min (! length s1) (! length s2))))
@@ -859,6 +869,21 @@
              (l (cdr list)))
     (cond ((null? l) s)
           (#t (loop (f s (car l)) (cdr l))))))
+
+(require 'regex)
+
+(define (compound-match? pattern string)
+  (define (compound-match% pattern-list string-list)
+    (cond ((eq? () pattern-list) #t)
+	  ((eq? () string-list) #f)
+	  ((! starts-with (as String (car string-list)) (as String (car pattern-list)))
+	   (compound-match% (cdr pattern-list) (cdr string-list)))
+	  (else #f)))
+  (compound-match% (regex-split "-" pattern) (regex-split "-" string)))
+
+(defslimefun completions (env (pattern <str>) _)
+  (completions-with-matcher env pattern compound-match?))
+
 
 ;;; Quit
 
