@@ -631,7 +631,6 @@
        (df name (args ...) body ...)
        (put *slime-funs* 'name name)))))
 
-(define swank-coding-system "utf-8-unix")
 
 (defslimefun connection-info ((env <env>))
   (let ((prop java.lang.System:getProperty))
@@ -643,7 +642,7 @@
     :machine (:instance ,(prop "java.vm.name") :type ,(prop "os.name")
                         :version ,(prop "java.runtime.version"))
     :features ()
-    :encoding (:coding-systems (,swank-coding-system))
+    :encoding (:coding-systems ("utf-8-unix"))
     :package (:name "??" :prompt ,(! getName env)))))
 
  
