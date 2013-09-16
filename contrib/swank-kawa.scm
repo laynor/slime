@@ -427,7 +427,9 @@
 ;; using bidirectional channels just sucks.  Mailboxes owned by a
 ;; single thread to which everybody can send are much easier to use.
 
-(define *slime-repl-output-port* #f)
+(let ((x (ignore-errors *slime-repl-output-port*)))
+  (define *slime-repl-output-port* x))
+
 
 (df dispatch-events ((s <socket>))
   (mlet* ((charset "iso-8859-1")
@@ -834,9 +836,10 @@
 (defslimefun load-file (env filename)
   (format "Loaded: ~a => ~s" filename (eval `(load ,filename) env)))
 
+
 ;;;; Completion
 
-(define (completions-with-matcher env (pattern <str>) match?)
+(define (symbol-completions env (pattern :: <str>) match?)
   (let* ((env (as <gnu.mapping.InheritingEnvironment> env))
          (matches (packing (pack)
                     (let ((iter (! enumerate-all-locations env)))
@@ -849,6 +852,11 @@
                                  (pack name)))))))))))
     `(,matches ,(cond ((null? matches) pattern)
                       (#t (fold+ common-prefix matches))))))
+
+(define (completions-with-matcher env (pattern :: <str>) match?)
+  (if (>= (! index-of pattern ":") 0)
+      (or (ignore-errors (meth/field-completions env pattern match?)) 'nil)
+      (symbol-completions env pattern match?)))
 
 
 (defslimefun simple-completions (env (pattern <str>) _)
@@ -871,18 +879,45 @@
 
 (require 'regex)
 
-(define (compound-match? pattern string)
-  (define (compound-match% pattern-list string-list)
-    (cond ((eq? () pattern-list) #t)
-	  ((eq? () string-list) #f)
-	  ((! starts-with (as String (car string-list)) (as String (car pattern-list)))
-	   (compound-match% (cdr pattern-list) (cdr string-list)))
-	  (else #f)))
-  (compound-match% (regex-split "-" pattern) (regex-split "-" string)))
-
-(defslimefun completions (env (pattern <str>) _)
+(defslimefun completions (env (pattern :: <str>) _)
   (completions-with-matcher env pattern compound-match?))
 
+(define (remove-duplicates l)
+  (define (rd l seen)
+    (mcase l
+           (()
+            ())
+           ((x . xs)
+            (if (member x seen)
+                (rd xs seen)
+                (cons x (rd xs (cons x seen)))))))
+  (rd l ()))
+
+(define (meth/field-completions env (pattern :: <str>) match?)
+  (let* ((meth/field-path (regex-split ":" pattern))
+         (reverse-path (reverse meth/field-path))
+         (object-path (reverse (cdr reverse-path)))
+         (object-str (string-join ":" object-path))
+         (accessible-pattern (car reverse-path))
+         (obj (eval (read-from-string (string-join ":" object-path)) env))
+         (matched-accessibles (filter (jaccessibles obj)
+                                      (lambda (acc)
+                                        (and (match? accessible-pattern (! get-name acc))
+                                             (or (and (class? obj)
+                                                      (jrstatic? acc))
+                                                 (and (not (class? obj))
+                                                      (not (jrstatic? acc))))))))
+         (matched-names (remove-duplicates (map (lambda (acc)
+                                                  (let ((acc-name (! get-name acc)))
+                                                    (<str> (string-append object-str ":" acc-name))))
+                                                matched-accessibles))))
+    (list matched-names
+          (if (null? matched-names)
+              pattern
+              (fold+ common-prefix matched-names)))))
+
+
+;;;; Random Slimefuns
 
 ;;; Quit
 
@@ -2094,7 +2129,7 @@
     (apply format swank-log-port fstr args)
     (force-output swank-log-port))
   #!void)
-
+
 ;;;; Random helpers
 
 (df 1+ (x) (+ x 1))
@@ -2358,6 +2393,12 @@
       (when (test e)
         (pack e)))))
 
+(df filter-out ((i <iterable>) test => <list>)
+  (packing (pack)
+    (for ((e i))
+      (unless (test e)
+        (pack e)))))
+
 (df iter ((i <iterable>) f)
   (for ((e i)) (f e)))
 
@@ -2409,7 +2450,143 @@
         (#t (error "Not a string designator" obj
                    (class-name-sans-package obj)))))
 
+
+;;;;  Reflection
 
+(define (jmethods obj)
+    (if (class? obj)
+	(! get-methods (as class obj))
+	(!! get-methods get-class obj)))
+
+(define (jfields obj)
+  (if (class? obj)
+      (! get-fields (as class obj))
+      (!! get-methods get-class obj)))
+
+(define (jaccessibles obj)
+  (append (array->list (jmethods obj))
+          (array->list (jfields obj))))
+
+
+(define-alias <Modifier> <java.lang.reflect.Modifier>)
+
+(define-syntax defjmodifier
+  (syntax-rules ()
+    ((defjmodifier jmethod-name scheme-name)
+     (define (scheme-name acc)
+       (invoke-static <Modifier> 'jmethod-name (! get-modifiers acc))))))
+
+(defjmodifier public?    jrpublic?)
+(defjmodifier private?   jrprivate?)
+(defjmodifier static?    jrstatic?)
+(defjmodifier final?     jrfinal?)
+(defjmodifier protected? jrprotected?)
+(defjmodifier abstract?  jrabstract?)
+(defjmodifier native?    jrnative?)
+;; (defjmodifier interface? jinterface?)
+(defjmodifier synchronized? jsynchronized?)
+
+
+;;;;  String matching
+
+
+(define (string-join sep strings)
+  (format #f (format #f "~~{~~a~~^~a~~}" sep) strings))
+
+(define (array->list array)
+  (packing (pack)
+	   (dotimes (i array:length)
+		    (pack (array i)))))
+
+(df string-blank? ((str :: <str>) => <boolean>)
+    (or (eq? #!null str)
+	(regex-match? "^[ \t\n]*$" str)))
+
+(df simple-match? ((pattern :: <str>) (string :: <str>) => <boolean>)
+    (or (string-blank? pattern)
+	(! starts-with string pattern)))
+
+(df compound-match? ((pattern :: <str>) (string :: <str>) => <boolean>)
+    (or (string-blank? pattern)
+	(let ((regex-pattern (string-append "^"
+					    (string-join "[^-]*-" (regex-split "-" pattern))
+					    ".*$")))
+	  (regex-match? regex-pattern string))))
+
+(df fuzzy-match? ((pattern :: <str>) (str :: <str>) ==> <boolean>)
+  (or (string-blank? pattern)
+      (let ((regex-pattern (string-join ".*" (map string (string->list pattern)))))
+	(regex-match? regex-pattern str))))
+
+
+;;; Documentation
+(defslimefun documentation-symbol (env symbol-name)
+  'nil)
+
+(define (function-signature fun)
+  (let ((min (! min-args fun))
+        (max (! max-args fun)))
+    (append (list (! get-name fun))
+            (make-list min "_")
+            (cond ((> max min)
+                   (cons "&optional" (make-list (- max min) "_")))
+                  ((< max min)
+                   '("args..."))
+                  (#t ()))
+            )))
+
+(define (function-signature-with-arg fun argpos)
+  (define (highlight-arg funsig argp)
+    (cond ((null? funsig)
+           ())
+          ((or (= 0 argp)
+               (string=? (car funsig)
+                         "args..."))
+           (cons (string-append "===> " (car funsig) " <===")
+                 (cdr funsig)))
+          (#t (cons (car funsig) (highlight-arg (cdr funsig) (- argp 1))))))
+  (let ((fsig (function-signature fun)))
+    (highlight-arg fsig argpos)))
+
+(define (find-cursor-enclosing-form raw-form)
+  (let ((cm '|swank::%cursor-marker%|))
+    (cond ((and (list? raw-form)
+                (member cm raw-form))
+           raw-form)
+          ((list? raw-form)
+           (fold+ (lambda (el1 el2)
+                    (or el1 el2))
+                  (map find-cursor-enclosing-form raw-form)))
+          (#t #f))))
+
+
+
+(defslimefun autodoc (env raw-form #!optional foo bar)
+  (list (or (ignore-errors
+             (let* ((form (find-cursor-enclosing-form raw-form))
+                    (fun (eval (read-from-string (car form)) env)))
+               (or (ignore-errors ; scheme-function
+                    (format #f "~a"
+                            (function-signature-with-arg fun
+                                                         (- (list-index-of '|swank::%cursor-marker%|
+                                                                           form
+                                                                           eq?)
+                                                            1))))
+                   (ignore-errors ; java method
+                    #f)
+                   (format #f "~S" form))))
+            "foobar")
+        't))
+
+(define (list-index-of el list test)
+  (define (f% list idx)
+    (cond ((eq? () list)
+           #f)
+          ((test el (car list))
+           idx)
+          (#t
+           (f% (cdr list) (+ 1 idx)))))
+  (f% list 0))
 
 ;; Local Variables:
 ;; compile-command: "\
